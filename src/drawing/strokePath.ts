@@ -3,37 +3,25 @@
  *
  * GPU-accelerated stroke rendering via filled tapered polygons.
  *
- * WHY NOT CIRCLES?
- * ----------------
- * The previous approach drew one <Circle> Skia element per smoothed sample point.
- * With stepsPerSegment=3 and a 200-point stroke, that's ~600 individual draw calls
- * per stroke, all dispatched from the JS thread and diffed by React on every frame.
+ * Combines the native-Skia Path approach (one GPU draw call per stroke) with
+ * algorithms ported from `perfect-freehand` by Steve Ruiz:
  *
- * A tapered polygon ("ribbon") encodes the entire stroke as a single filled Path.
- * The GPU renders it in one draw call regardless of stroke length.
- * CPU work drops from O(samples × stepsPerSegment) to O(controlPoints) per frame.
+ *  • STREAMLINE — Input smoothing via lerp between previous smoothed point
+ *    and current raw point. Removes jitter without adding latency.
+ *  • THINNING + EASING — Configurable pressure-to-radius mapping with a
+ *    custom easing curve.
+ *  • VELOCITY PRESSURE SIMULATION — When real pressure data is absent or
+ *    unreliable, pressure is simulated from drawing speed.
+ *  • START / END TAPERING — Gradual radius taper at stroke endpoints with
+ *    configurable distance and easing.
+ *  • SHARP CORNER HANDLING — Detects >90° turns and inserts rounded caps to
+ *    prevent polygon self-intersection.
+ *  • INITIAL PRESSURE SMOOTHING — Averages the first few points' pressure
+ *    to prevent "fat starts" from slow stroke beginnings.
  *
- * HOW IT WORKS
- * ------------
- * For each raw control point we compute a perpendicular offset scaled by the
- * pressure-derived radius, producing left/right "rail" points. Rails are
- * connected with Catmull-Rom → Bezier cubicTo() calls — O(n) path verbs
- * instead of O(n × steps) lineTo segments — producing smoother curves with
- * ~4× fewer JSI bridge crossings. Round caps join the rails at start and end.
- * The result is a single filled Path — one GPU draw call.
- *
- * VOLATILE PATHS (Skia GPU hint)
- * ------------------------------
- * Active (in-progress) stroke paths are marked setIsVolatile(true). This tells
- * Skia's GPU backend to skip caching intermediate rasterisation data for the
- * path, avoiding wasted cache-invalidation on paths that change every frame.
- *
- * SKIA PATH (not SVG string)
- * --------------------------
- * We use `Skia.Path.Make()` directly instead of building an SVG string.
- * Skia paths are compiled to GPU-ready draw commands immediately; SVG strings
- * need to be parsed back into paths first. For paths that update every frame
- * (the active stroke) this saves significant CPU time.
+ * OUTPUT: A single filled Skia Path — one GPU draw call per stroke.
+ * All intermediate computations happen in JS; the path uses native cubicTo /
+ * arcToOval commands that compile directly to GPU-ready draw data.
  */
 
 import { Skia, SkPath } from '@shopify/react-native-skia';
@@ -41,16 +29,555 @@ import { Skia, SkPath } from '@shopify/react-native-skia';
 export type Point = { x: number; y: number; pressure?: number };
 
 // ---------------------------------------------------------------------------
-// Catmull-Rom → Bezier smoothing (kept in this file for locality)
+// Options — mirrors perfect-freehand's StrokeOptions adapted for our system
+// ---------------------------------------------------------------------------
+
+export interface StrokePathOptions {
+  /** Base size (diameter). Default 16. */
+  size?: number;
+  /**
+   * How much pressure affects width. 0 = constant width, 1 = full variation.
+   * Negative values invert (lighter pressure = thicker). Default 0.5.
+   */
+  thinning?: number;
+  /**
+   * Minimum distance between outline points (as fraction of size).
+   * Higher = fewer polygon vertices = smoother edges. Default 0.5.
+   */
+  smoothing?: number;
+  /**
+   * Input smoothing. 0 = no smoothing (raw input), 1 = maximum smoothing.
+   * Interpolates between previous smoothed point and raw input. Default 0.5.
+   */
+  streamline?: number;
+  /** Easing function applied to pressure before radius calculation. */
+  easing?: (t: number) => number;
+  /** Whether to simulate pressure from velocity when real pressure is absent. Default false (use real stylus pressure). */
+  simulatePressure?: boolean;
+  /** Start of stroke: cap shape and taper. */
+  start?: { cap?: boolean; taper?: number | boolean; easing?: (t: number) => number };
+  /** End of stroke: cap shape and taper. */
+  end?: { cap?: boolean; taper?: number | boolean; easing?: (t: number) => number };
+  /** Whether this is a completed stroke (vs in-progress). Default false. */
+  last?: boolean;
+}
+
+const DEFAULT_OPTIONS: Required<StrokePathOptions> = {
+  size: 16,
+  thinning: 0.5,
+  smoothing: 0.5,
+  streamline: 0.5,
+  easing: (t: number) => t,
+  simulatePressure: false,
+  start: { cap: true, taper: false, easing: (t: number) => t * (2 - t) },
+  end: { cap: true, taper: false, easing: (t: number) => { t -= 1; return t * t * t + 1; } },
+  last: false,
+};
+
+// ---------------------------------------------------------------------------
+// Constants (ported from perfect-freehand)
+// ---------------------------------------------------------------------------
+
+const RATE_OF_PRESSURE_CHANGE = 0.275;
+const FIXED_PI = Math.PI + 0.0001;
+const MIN_RADIUS = 0.01;
+const MIN_STREAMLINE_T = 0.15;
+const STREAMLINE_T_RANGE = 0.85;
+const END_NOISE_THRESHOLD = 3;
+const CORNER_CAP_SEGMENTS = 13;
+
+// ---------------------------------------------------------------------------
+// Helper functions (ported from perfect-freehand)
+// ---------------------------------------------------------------------------
+
+function simulatePressure(
+  prevPressure: number,
+  distance: number,
+  size: number,
+): number {
+  const sp = Math.min(1, distance / size);
+  const rp = Math.min(1, 1 - sp);
+  return Math.min(1, prevPressure + (rp - prevPressure) * (sp * RATE_OF_PRESSURE_CHANGE));
+}
+
+function getStrokeRadius(
+  size: number,
+  thinning: number,
+  pressure: number,
+  easing: (t: number) => number,
+): number {
+  return size * easing(0.5 - thinning * (0.5 - pressure));
+}
+
+function computeTaperDistance(
+  taper: boolean | number | undefined,
+  size: number,
+  totalLength: number,
+): number {
+  if (taper === false || taper === undefined) return 0;
+  if (taper === true) return Math.max(size, totalLength);
+  return taper;
+}
+
+/** Dot product of 2D vectors. */
+function dot(ax: number, ay: number, bx: number, by: number): number {
+  return ax * bx + ay * by;
+}
+
+// ---------------------------------------------------------------------------
+// Processed stroke point (intermediate representation)
+// ---------------------------------------------------------------------------
+
+interface StrokePoint {
+  x: number;
+  y: number;
+  pressure: number;
+  /** Unit vector from previous point to this point. */
+  vx: number;
+  vy: number;
+  /** Distance from previous point. */
+  distance: number;
+  /** Cumulative running length. */
+  runningLength: number;
+  /** Computed radius at this point. */
+  radius: number;
+}
+
+// ---------------------------------------------------------------------------
+// Step 1: Process raw points into StrokePoints (streamline + pressure)
+// ---------------------------------------------------------------------------
+
+function processPoints(
+  rawPoints: Point[],
+  opts: Required<StrokePathOptions>,
+): StrokePoint[] {
+  if (rawPoints.length === 0) return [];
+
+  const {
+    size,
+    thinning,
+    streamline,
+    easing,
+    simulatePressure: shouldSimulatePressure,
+    last: isComplete,
+  } = opts;
+
+  const t = MIN_STREAMLINE_T + (1 - streamline) * STREAMLINE_T_RANGE;
+
+  // Streamline: interpolate raw input toward previous smoothed position.
+  const smoothed: { x: number; y: number; pressure: number }[] = [];
+  smoothed.push({
+    x: rawPoints[0].x,
+    y: rawPoints[0].y,
+    pressure: rawPoints[0].pressure ?? 0.5,
+  });
+
+  for (let i = 1; i < rawPoints.length; i++) {
+    const prev = smoothed[smoothed.length - 1];
+    const raw = rawPoints[i];
+    const isLast = i === rawPoints.length - 1;
+
+    // For the final point of a completed stroke, use the exact position.
+    const px = isComplete && isLast ? raw.x : prev.x + (raw.x - prev.x) * t;
+    const py = isComplete && isLast ? raw.y : prev.y + (raw.y - prev.y) * t;
+
+    // Skip if the smoothed point didn't actually move.
+    const dx = px - prev.x;
+    const dy = py - prev.y;
+    if (dx * dx + dy * dy < 0.01) continue;
+
+    smoothed.push({ x: px, y: py, pressure: raw.pressure ?? 0.5 });
+  }
+
+  if (smoothed.length === 1) {
+    // Add a tiny offset so we have at least 2 points.
+    smoothed.push({
+      x: smoothed[0].x + 1,
+      y: smoothed[0].y + 1,
+      pressure: smoothed[0].pressure,
+    });
+  }
+
+  // Build StrokePoint array with vectors, distances, running length, and radius.
+  const result: StrokePoint[] = [];
+  let runningLength = 0;
+  let prevPressure = smoothed[0].pressure;
+
+  // Initial pressure averaging (prevents fat starts).
+  const initSlice = smoothed.slice(0, 10);
+  prevPressure = initSlice.reduce((acc, pt, idx) => {
+    let p = pt.pressure;
+    if (shouldSimulatePressure && idx > 0) {
+      const d = Math.hypot(
+        pt.x - (idx > 0 ? smoothed[idx - 1].x : pt.x),
+        pt.y - (idx > 0 ? smoothed[idx - 1].y : pt.y),
+      );
+      p = simulatePressure(acc, d, size);
+    }
+    return (acc + p) / 2;
+  }, smoothed[0].pressure);
+
+  for (let i = 0; i < smoothed.length; i++) {
+    const pt = smoothed[i];
+    let vx = 0, vy = 0, distance = 0;
+
+    if (i > 0) {
+      const prev = smoothed[i - 1];
+      const dx = pt.x - prev.x;
+      const dy = pt.y - prev.y;
+      distance = Math.hypot(dx, dy);
+      runningLength += distance;
+      if (distance > 0) {
+        vx = dx / distance;
+        vy = dy / distance;
+      }
+    }
+
+    let pressure = pt.pressure;
+    if (shouldSimulatePressure) {
+      pressure = simulatePressure(prevPressure, distance, size);
+    }
+
+    const radius = thinning
+      ? Math.max(MIN_RADIUS, getStrokeRadius(size, thinning, pressure, easing))
+      : size / 2;
+
+    result.push({ x: pt.x, y: pt.y, pressure, vx, vy, distance, runningLength, radius });
+    prevPressure = pressure;
+  }
+
+  // Set the first point's vector to match the second.
+  if (result.length > 1) {
+    result[0].vx = result[1].vx;
+    result[0].vy = result[1].vy;
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Build outline (left/right rail points with tapering + corners)
+// ---------------------------------------------------------------------------
+
+interface OutlineArrays {
+  leftX: number[];
+  leftY: number[];
+  rightX: number[];
+  rightY: number[];
+  /** Array of [index, radius] for points that need a sharp-corner cap. */
+  cornerCaps: { x: number; y: number; vx: number; vy: number; radius: number }[];
+}
+
+function buildOutlineArrays(
+  pts: StrokePoint[],
+  opts: Required<StrokePathOptions>,
+): OutlineArrays {
+  const { size, smoothing, start, end, last: isComplete } = opts;
+  const n = pts.length;
+  const totalLength = pts[n - 1].runningLength;
+
+  const taperStart = computeTaperDistance(start.taper, size, totalLength);
+  const taperEnd = computeTaperDistance(end.taper, size, totalLength);
+  const taperStartEase = start.easing ?? DEFAULT_OPTIONS.start.easing!;
+  const taperEndEase = end.easing ?? DEFAULT_OPTIONS.end.easing!;
+
+  const minDist2 = Math.pow(size * smoothing, 2);
+
+  const leftX: number[] = [];
+  const leftY: number[] = [];
+  const rightX: number[] = [];
+  const rightY: number[] = [];
+  const cornerCaps: OutlineArrays['cornerCaps'] = [];
+
+  let isPrevSharpCorner = false;
+
+  for (let i = 0; i < n; i++) {
+    const pt = pts[i];
+    const isLast = i === n - 1;
+
+    // End noise filtering.
+    if (!isLast && totalLength - pt.runningLength < END_NOISE_THRESHOLD) continue;
+
+    // Apply tapering.
+    let radius = pt.radius;
+    const taperStartStr = pt.runningLength < taperStart
+      ? taperStartEase(pt.runningLength / taperStart)
+      : 1;
+    const taperEndStr = totalLength - pt.runningLength < taperEnd
+      ? taperEndEase((totalLength - pt.runningLength) / taperEnd)
+      : 1;
+    radius = Math.max(MIN_RADIUS, radius * Math.min(taperStartStr, taperEndStr));
+
+    // Sharp corner detection.
+    const nextVx = isLast ? pt.vx : pts[i + 1].vx;
+    const nextVy = isLast ? pt.vy : pts[i + 1].vy;
+    const nextDot = isLast ? 1 : dot(pt.vx, pt.vy, nextVx, nextVy);
+    const prevDot = i > 0 ? dot(pt.vx, pt.vy, pts[i - 1].vx, pts[i - 1].vy) : 1;
+
+    const isSharpCorner = prevDot < 0 && !isPrevSharpCorner;
+    const isNextSharp = nextDot < 0;
+
+    if (isSharpCorner || isNextSharp) {
+      cornerCaps.push({ x: pt.x, y: pt.y, vx: pt.vx, vy: pt.vy, radius });
+
+      // Add semicircular cap points at the corner.
+      const perpVx = pt.vy;
+      const perpVy = -pt.vx;
+      const step = 1 / CORNER_CAP_SEGMENTS;
+      for (let t = 0; t <= 1; t += step) {
+        const angle = FIXED_PI * t;
+        const cosA = Math.cos(angle);
+        const sinA = Math.sin(angle);
+        const ox = perpVx * radius;
+        const oy = perpVy * radius;
+        // Left: rotate (point - offset) around point.
+        const lrx = -ox * cosA - (-oy) * sinA;
+        const lry = -ox * sinA + (-oy) * cosA;
+        leftX.push(pt.x + lrx);
+        leftY.push(pt.y + lry);
+        // Right: rotate (point + offset) around point.
+        const rrx = ox * cosA - oy * sinA;
+        const rry = ox * sinA + oy * cosA;
+        rightX.push(pt.x + rrx);
+        rightY.push(pt.y + rry);
+      }
+
+      if (isNextSharp) isPrevSharpCorner = true;
+      continue;
+    }
+
+    isPrevSharpCorner = false;
+
+    // Perpendicular offset direction — blend current and next vectors.
+    let ox: number, oy: number;
+    if (isLast) {
+      ox = pt.vy;
+      oy = -pt.vx;
+    } else {
+      // Interpolate between current and next vector for smoother offset direction.
+      const blendX = nextVx + pt.vx;
+      const blendY = nextVy + pt.vy;
+      const blendLen = Math.hypot(blendX, blendY);
+      if (blendLen < 1e-6) {
+        ox = pt.vy;
+        oy = -pt.vx;
+      } else {
+        // Perpendicular of the blended direction.
+        ox = blendY / blendLen;
+        oy = -blendX / blendLen;
+      }
+    }
+
+    const lx = pt.x - ox * radius;
+    const ly = pt.y - oy * radius;
+    const rx = pt.x + ox * radius;
+    const ry = pt.y + oy * radius;
+
+    // Min-distance filtering for outline smoothing.
+    if (i <= 1 || leftX.length === 0 || squaredDist(leftX[leftX.length - 1], leftY[leftY.length - 1], lx, ly) > minDist2) {
+      leftX.push(lx);
+      leftY.push(ly);
+    }
+    if (i <= 1 || rightX.length === 0 || squaredDist(rightX[rightX.length - 1], rightY[rightY.length - 1], rx, ry) > minDist2) {
+      rightX.push(rx);
+      rightY.push(ry);
+    }
+  }
+
+  return { leftX, leftY, rightX, rightY, cornerCaps };
+}
+
+function squaredDist(ax: number, ay: number, bx: number, by: number): number {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return dx * dx + dy * dy;
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Assemble outline points into a Skia Path
+// ---------------------------------------------------------------------------
+
+function assembleSkiaPath(
+  pts: StrokePoint[],
+  outline: OutlineArrays,
+  opts: Required<StrokePathOptions>,
+): SkPath {
+  const path = Skia.Path.Make();
+  const { leftX: lx, leftY: ly, rightX: rx, rightY: ry } = outline;
+  const { start, end } = opts;
+
+  const nL = lx.length;
+  const nR = rx.length;
+
+  if (nL === 0 || nR === 0) return path;
+
+  const totalLength = pts[pts.length - 1].runningLength;
+  const taperStart = computeTaperDistance(start.taper, opts.size, totalLength);
+  const taperEnd = computeTaperDistance(end.taper, opts.size, totalLength);
+  const capStart = start.cap !== false;
+  const capEnd = end.cap !== false;
+
+  // Very short stroke → dot.
+  if (pts.length === 1 || (nL < 2 && nR < 2)) {
+    const r = pts[0].radius;
+    path.addCircle(pts[0].x, pts[0].y, Math.max(0.5, r));
+    return path;
+  }
+
+  // ---- Start cap ----
+  path.moveTo(rx[0], ry[0]);
+
+  if (taperStart > 0) {
+    // Tapered start: just begin at right[0], no cap needed.
+  } else if (capStart) {
+    // Round start cap: semicircle from right[0] around center to left[0].
+    const cx = (rx[0] + lx[0]) / 2;
+    const cy = (ry[0] + ly[0]) / 2;
+    const r = Math.hypot(rx[0] - lx[0], ry[0] - ly[0]) / 2;
+    if (r > 0.1) {
+      const startAngle = Math.atan2(ry[0] - cy, rx[0] - cx) * (180 / Math.PI);
+      path.arcToOval(
+        { x: cx - r, y: cy - r, width: r * 2, height: r * 2 },
+        startAngle,
+        180,
+        false,
+      );
+    }
+  } else {
+    // Flat start cap: just lineTo left[0].
+    path.lineTo(lx[0], ly[0]);
+  }
+
+  // ---- Left rail (forward) — Catmull-Rom → Bezier cubics ----
+  if (nL > 1) {
+    // Ensure we start at left[0].
+    if (taperStart > 0 || !capStart) {
+      // We haven't arrived at left[0] via the cap, so moveTo/lineTo.
+    }
+    for (let i = 0; i < nL - 1; i++) {
+      const i0 = Math.max(0, i - 1);
+      const i3 = Math.min(nL - 1, i + 2);
+      path.cubicTo(
+        lx[i] + (lx[i + 1] - lx[i0]) / 6,
+        ly[i] + (ly[i + 1] - ly[i0]) / 6,
+        lx[i + 1] - (lx[i3] - lx[i]) / 6,
+        ly[i + 1] - (ly[i3] - ly[i]) / 6,
+        lx[i + 1],
+        ly[i + 1],
+      );
+    }
+  }
+
+  // ---- End cap ----
+  if (taperEnd > 0) {
+    // Tapered end: connect to last right point directly.
+    path.lineTo(rx[nR - 1], ry[nR - 1]);
+  } else if (capEnd) {
+    // Round end cap: semicircle from left[last] around center to right[last].
+    const cx = (lx[nL - 1] + rx[nR - 1]) / 2;
+    const cy = (ly[nL - 1] + ry[nR - 1]) / 2;
+    const r = Math.hypot(lx[nL - 1] - rx[nR - 1], ly[nL - 1] - ry[nR - 1]) / 2;
+    if (r > 0.1) {
+      const endAngle = Math.atan2(ly[nL - 1] - cy, lx[nL - 1] - cx) * (180 / Math.PI);
+      path.arcToOval(
+        { x: cx - r, y: cy - r, width: r * 2, height: r * 2 },
+        endAngle,
+        180,
+        false,
+      );
+    }
+  } else {
+    // Flat end cap.
+    path.lineTo(rx[nR - 1], ry[nR - 1]);
+  }
+
+  // ---- Right rail (backward) — Catmull-Rom → Bezier cubics ----
+  if (nR > 1) {
+    for (let i = nR - 1; i > 0; i--) {
+      const i0 = Math.min(nR - 1, i + 1);
+      const i3 = Math.max(0, i - 2);
+      path.cubicTo(
+        rx[i] + (rx[i - 1] - rx[i0]) / 6,
+        ry[i] + (ry[i - 1] - ry[i0]) / 6,
+        rx[i - 1] - (rx[i3] - rx[i]) / 6,
+        ry[i - 1] - (ry[i3] - ry[i]) / 6,
+        rx[i - 1],
+        ry[i - 1],
+      );
+    }
+  }
+
+  path.close();
+  return path;
+}
+
+// ---------------------------------------------------------------------------
+// Public API: buildStrokePath (replaces buildRibbonPath)
 // ---------------------------------------------------------------------------
 
 /**
- * Sample a Catmull-Rom spline through `points` at `stepsPerSegment` interior
- * points per segment. Returns an array of (x, y, pressure) ready for ribbon building.
+ * Build a filled Skia Path for a pressure-sensitive stroke.
  *
- * Kept here (duplicating smoothing.ts) so strokePath.ts is self-contained and
- * tree-shakeable independently.
+ * Combines the ribbon approach with perfect-freehand's streamline smoothing,
+ * velocity pressure simulation, tapering, and sharp corner handling.
+ *
+ * @param points    Raw input points from the stylus.
+ * @param options   Stroke rendering options.
  */
+export function buildStrokePath(
+  points: Point[],
+  options: Partial<StrokePathOptions> = {},
+): SkPath {
+  const opts = { ...DEFAULT_OPTIONS, ...options } as Required<StrokePathOptions>;
+  opts.start = { ...DEFAULT_OPTIONS.start, ...options.start };
+  opts.end = { ...DEFAULT_OPTIONS.end, ...options.end };
+
+  if (points.length === 0) return Skia.Path.Make();
+
+  const strokePoints = processPoints(points, opts);
+  if (strokePoints.length === 0) return Skia.Path.Make();
+
+  const outline = buildOutlineArrays(strokePoints, opts);
+  return assembleSkiaPath(strokePoints, outline, opts);
+}
+
+// ---------------------------------------------------------------------------
+// Legacy API: buildRibbonPath (backward compat for committed strokes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a filled Skia Path using the old minRadius/maxRadius API.
+ * Converts to the new options format internally.
+ */
+export function buildRibbonPath(
+  points: Point[],
+  minRadius: number,
+  maxRadius: number,
+): SkPath {
+  // Map old min/max radius to perfect-freehand size/thinning model.
+  // size = diameter = 2 * maxRadius
+  // At pressure 0.5 (default), radius should be (min+max)/2.
+  // At pressure 1.0, radius should be maxRadius.
+  // At pressure 0.0, radius should be minRadius.
+  const size = maxRadius * 2;
+  const thinning = maxRadius > 0 ? 1 - (minRadius / maxRadius) : 0.5;
+
+  return buildStrokePath(points, {
+    size,
+    thinning,
+    smoothing: 0.3,
+    streamline: 0.4,
+    simulatePressure: false,
+    start: { cap: true, taper: false },
+    end: { cap: true, taper: false },
+    last: true,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Catmull-Rom sampler (legacy, kept for eraser and other consumers)
+// ---------------------------------------------------------------------------
+
 export function sampleCenterline(
   points: Point[],
   stepsPerSegment: number,
@@ -91,402 +618,105 @@ export function sampleCenterline(
 }
 
 // ---------------------------------------------------------------------------
-// Ribbon (tapered polygon) builder
+// IncrementalRibbon — live stroke builder with perfect-freehand processing
 // ---------------------------------------------------------------------------
 
 /**
- * Build a filled Skia Path that represents a variable-width stroke.
+ * IncrementalRibbon builds a stroke path incrementally for live drawing.
  *
- * Algorithm:
- *  1. For each raw control point, compute the pressure-derived radius and the
- *     perpendicular offset from the tangent direction.
- *  2. Build left/right "rail" points offset from the centerline.
- *  3. Connect rails with Catmull-Rom → Bezier cubicTo() calls, producing a
- *     smooth closed polygon with round caps at start and end.
+ * Uses the full perfect-freehand processing pipeline (streamline, pressure
+ * simulation, tapering, sharp corners) but with cached computations and
+ * Skia-native path output.
  *
- * This eliminates the previous sampleCenterline() oversampling step entirely.
- * Path verb count drops from O(n × steps) lineTo to O(n) cubicTo — ~4× fewer
- * JSI bridge crossings while producing smoother GPU-native Bezier curves.
- *
- * @param points    Raw control points from the stylus.
- * @param minRadius Radius at zero pressure.
- * @param maxRadius Radius at full pressure.
- */
-export function buildRibbonPath(
-  points: Point[],
-  minRadius: number,
-  maxRadius: number,
-): SkPath {
-  const path = Skia.Path.Make();
-
-  if (points.length === 0) return path;
-
-  // Single point → filled circle
-  if (points.length === 1) {
-    const r = minRadius + (maxRadius - minRadius) * (points[0].pressure ?? 0.5);
-    path.addCircle(points[0].x, points[0].y, Math.max(0.5, r));
-    return path;
-  }
-
-  const n = points.length;
-
-  // Pre-compute radii and perpendicular unit vectors for each control point.
-  const radii = new Float32Array(n);
-  const perpX = new Float32Array(n);
-  const perpY = new Float32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    radii[i] = Math.max(
-      0.5,
-      minRadius + (maxRadius - minRadius) * (points[i].pressure ?? 0.5),
-    );
-
-    // Tangent: forward diff at start, backward at end, central elsewhere.
-    let tx: number, ty: number;
-    if (i === 0) {
-      tx = points[1].x - points[0].x;
-      ty = points[1].y - points[0].y;
-    } else if (i === n - 1) {
-      tx = points[n - 1].x - points[n - 2].x;
-      ty = points[n - 1].y - points[n - 2].y;
-    } else {
-      tx = points[i + 1].x - points[i - 1].x;
-      ty = points[i + 1].y - points[i - 1].y;
-    }
-
-    const len = Math.hypot(tx, ty);
-    if (len < 1e-6) {
-      perpX[i] = i > 0 ? perpX[i - 1] : 0;
-      perpY[i] = i > 0 ? perpY[i - 1] : 1;
-    } else {
-      perpX[i] = -ty / len;
-      perpY[i] = tx / len;
-    }
-  }
-
-  // Left and right rail arrays.
-  const leftX = new Float32Array(n);
-  const leftY = new Float32Array(n);
-  const rightX = new Float32Array(n);
-  const rightY = new Float32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    const cx = points[i].x;
-    const cy = points[i].y;
-    const r = radii[i];
-    leftX[i] = cx + perpX[i] * r;
-    leftY[i] = cy + perpY[i] * r;
-    rightX[i] = cx - perpX[i] * r;
-    rightY[i] = cy - perpY[i] * r;
-  }
-
-  // -------------------------------------------------------------------------
-  // Assemble the closed ribbon polygon
-  // -------------------------------------------------------------------------
-
-  // Start cap: semicircle from right[0] → left[0].
-  const startR = radii[0];
-  const startAngle = Math.atan2(perpY[0], perpX[0]) * (180 / Math.PI);
-
-  path.moveTo(rightX[0], rightY[0]);
-  path.arcToOval(
-    { x: points[0].x - startR, y: points[0].y - startR, width: startR * 2, height: startR * 2 },
-    startAngle + 90,
-    180,
-    false,
-  );
-
-  // Forward along the left rail — Catmull-Rom → Bezier cubics.
-  for (let i = 0; i < n - 1; i++) {
-    const i0 = Math.max(0, i - 1);
-    const i3 = Math.min(n - 1, i + 2);
-    path.cubicTo(
-      leftX[i] + (leftX[i + 1] - leftX[i0]) / 6,
-      leftY[i] + (leftY[i + 1] - leftY[i0]) / 6,
-      leftX[i + 1] - (leftX[i3] - leftX[i]) / 6,
-      leftY[i + 1] - (leftY[i3] - leftY[i]) / 6,
-      leftX[i + 1],
-      leftY[i + 1],
-    );
-  }
-
-  // End cap: semicircle from left[n-1] → right[n-1].
-  const endR = radii[n - 1];
-  const endAngle = Math.atan2(perpY[n - 1], perpX[n - 1]) * (180 / Math.PI);
-
-  path.arcToOval(
-    { x: points[n - 1].x - endR, y: points[n - 1].y - endR, width: endR * 2, height: endR * 2 },
-    endAngle - 90,
-    180,
-    false,
-  );
-
-  // Backward along the right rail — Catmull-Rom → Bezier cubics (reversed).
-  for (let i = n - 1; i > 0; i--) {
-    const i0 = Math.min(n - 1, i + 1);
-    const i3 = Math.max(0, i - 2);
-    path.cubicTo(
-      rightX[i] + (rightX[i - 1] - rightX[i0]) / 6,
-      rightY[i] + (rightY[i - 1] - rightY[i0]) / 6,
-      rightX[i - 1] - (rightX[i3] - rightX[i]) / 6,
-      rightY[i - 1] - (rightY[i3] - rightY[i]) / 6,
-      rightX[i - 1],
-      rightY[i - 1],
-    );
-  }
-
-  path.close();
-  return path;
-}
-
-// ---------------------------------------------------------------------------
-// Incremental path builder for the active (in-progress) stroke
-// ---------------------------------------------------------------------------
-
-/**
- * IncrementalRibbon builds the ribbon path with cached per-point data.
- *
- * PERFORMANCE MODEL
- * -----------------
- * Per-point math (radii, perpendiculars, rail offsets) is computed ONCE when
- * the point is added and cached in typed arrays. When a new point arrives only
- * the new point and the previous point (whose tangent depends on the new next
- * neighbour) are (re)computed — O(1) math per event.
- *
- * `getPath()` assembles the SkPath from pre-computed rail arrays. The work is
- * O(n) cubicTo JSI calls (unavoidable — Skia needs the full contour) but with
- * ZERO per-point math and ZERO typed-array allocation. For n = 300, the
- * cubicTo assembly takes ~1 ms on mid-range hardware; the math savings avoid
- * another ~0.5 ms of repeated work that was previously done every frame.
- *
- * Usage:
- *   const ribbon = new IncrementalRibbon(minR, maxR);
- *   ribbon.addPoint(x, y, pressure);   // call for each stylus sample
- *   const path = ribbon.getPath();     // call once per render
- *   ribbon.reset();                    // call on pen-up
+ * The path is rebuilt from cached smoothed points on each `getPath()` call.
+ * Streamline smoothing is applied incrementally as points arrive.
  */
 export class IncrementalRibbon {
   private minRadius: number;
   private maxRadius: number;
-  private points: Point[] = [];
+  private rawPoints: Point[] = [];
 
-  // Cached per-point computations — grown dynamically, never reallocated.
-  private _radii: number[] = [];
-  private _perpX: number[] = [];
-  private _perpY: number[] = [];
-  private _leftX: number[] = [];
-  private _leftY: number[] = [];
-  private _rightX: number[] = [];
-  private _rightY: number[] = [];
+  /** Streamline-smoothed points, updated incrementally in addPoint(). */
+  private smoothedPoints: Point[] = [];
 
-  /** Index up to which the cache is valid (inclusive). -1 = nothing cached. */
-  private _cacheValid = -1;
+  /** Options derived from minRadius/maxRadius on construction. */
+  private opts: Required<StrokePathOptions>;
 
   constructor(minRadius: number, maxRadius: number) {
     this.minRadius = minRadius;
     this.maxRadius = maxRadius;
+
+    const size = maxRadius * 2;
+    const thinning = maxRadius > 0 ? 1 - (minRadius / maxRadius) : 0.5;
+
+    this.opts = {
+      ...DEFAULT_OPTIONS,
+      size,
+      thinning,
+      smoothing: 0.3,
+      streamline: 0.4,
+      simulatePressure: false,
+      start: { cap: true, taper: false, easing: DEFAULT_OPTIONS.start.easing },
+      end: { cap: true, taper: false, easing: DEFAULT_OPTIONS.end.easing },
+      last: false,
+    };
   }
 
   addPoint(x: number, y: number, pressure: number): void {
-    this.points.push({ x, y, pressure });
+    this.rawPoints.push({ x, y, pressure });
 
-    // The previous point's tangent used a forward-diff or central-diff that
-    // depended on the "next" point. Now that there IS a next point, the
-    // previous entry must be recomputed. Invalidate from (len - 2).
-    const len = this.points.length;
-    if (this._cacheValid >= len - 2) {
-      this._cacheValid = Math.max(-1, len - 3);
-    }
-  }
+    // Incrementally apply streamline smoothing.
+    const t = MIN_STREAMLINE_T + (1 - this.opts.streamline) * STREAMLINE_T_RANGE;
 
-  // -----------------------------------------------------------------------
-  // Internal: update cached arrays for any new / invalidated indices.
-  // -----------------------------------------------------------------------
-
-  private _updateCache(): void {
-    const pts = this.points;
-    const n = pts.length;
-    if (n === 0) return;
-
-    const start = this._cacheValid + 1;
-
-    // Grow arrays if needed (cheap — push is amortised O(1)).
-    while (this._radii.length < n) {
-      this._radii.push(0);
-      this._perpX.push(0);
-      this._perpY.push(0);
-      this._leftX.push(0);
-      this._leftY.push(0);
-      this._rightX.push(0);
-      this._rightY.push(0);
-    }
-
-    for (let i = start; i < n; i++) {
-      // Pressure-derived radius.
-      const r = Math.max(
-        0.5,
-        this.minRadius +
-          (this.maxRadius - this.minRadius) * (pts[i].pressure ?? 0.5),
-      );
-      this._radii[i] = r;
-
-      // Tangent direction (forward / central / backward difference).
-      let tx: number, ty: number;
-      if (n === 1) {
-        // Single point — no neighbour to diff against; use zero tangent.
-        tx = 0;
-        ty = 0;
-      } else if (i === 0) {
-        tx = pts[1].x - pts[0].x;
-        ty = pts[1].y - pts[0].y;
-      } else if (i === n - 1) {
-        tx = pts[n - 1].x - pts[n - 2].x;
-        ty = pts[n - 1].y - pts[n - 2].y;
-      } else {
-        tx = pts[i + 1].x - pts[i - 1].x;
-        ty = pts[i + 1].y - pts[i - 1].y;
+    if (this.smoothedPoints.length === 0) {
+      this.smoothedPoints.push({ x, y, pressure });
+    } else {
+      const prev = this.smoothedPoints[this.smoothedPoints.length - 1];
+      const sx = prev.x + (x - prev.x) * t;
+      const sy = prev.y + (y - prev.y) * t;
+      const dx = sx - prev.x;
+      const dy = sy - prev.y;
+      if (dx * dx + dy * dy >= 0.01) {
+        this.smoothedPoints.push({ x: sx, y: sy, pressure });
       }
-
-      const len = Math.hypot(tx, ty);
-      if (len < 1e-6) {
-        this._perpX[i] = i > 0 ? this._perpX[i - 1] : 0;
-        this._perpY[i] = i > 0 ? this._perpY[i - 1] : 1;
-      } else {
-        this._perpX[i] = -ty / len;
-        this._perpY[i] = tx / len;
-      }
-
-      // Left / right rail offsets.
-      const cx = pts[i].x;
-      const cy = pts[i].y;
-      this._leftX[i] = cx + this._perpX[i] * r;
-      this._leftY[i] = cy + this._perpY[i] * r;
-      this._rightX[i] = cx - this._perpX[i] * r;
-      this._rightY[i] = cy - this._perpY[i] * r;
     }
-
-    this._cacheValid = n - 1;
   }
 
   /**
-   * Assemble the full ribbon SkPath from cached rail data.
-   *
-   * The math (radii, perpendiculars, rails) is already done — this method
-   * only issues Skia path-building commands using pre-computed numbers.
-   * Marked volatile so Skia skips GPU-side caching for in-progress paths.
+   * Build the stroke path from current smoothed points.
+   * Marked volatile for Skia GPU hint (skip caching in-progress paths).
    */
   getPath(): SkPath {
-    this._updateCache();
+    if (this.smoothedPoints.length === 0) return Skia.Path.Make();
 
-    const path = Skia.Path.Make();
-    const n = this.points.length;
+    const strokePoints = processPoints(this.smoothedPoints, this.opts);
+    if (strokePoints.length === 0) return Skia.Path.Make();
 
-    if (n === 0) return path;
-
-    if (n === 1) {
-      const r = this._radii[0];
-      path.addCircle(this.points[0].x, this.points[0].y, Math.max(0.5, r));
-      path.setIsVolatile(true);
-      return path;
-    }
-
-    const {
-      _radii: radii,
-      _perpX: perpX,
-      _perpY: perpY,
-      _leftX: lx,
-      _leftY: ly,
-      _rightX: rx,
-      _rightY: ry,
-      points: pts,
-    } = this;
-
-    // Start cap: semicircle right[0] → left[0].
-    const startR = radii[0];
-    const startAng = Math.atan2(perpY[0], perpX[0]) * (180 / Math.PI);
-    path.moveTo(rx[0], ry[0]);
-    path.arcToOval(
-      {
-        x: pts[0].x - startR,
-        y: pts[0].y - startR,
-        width: startR * 2,
-        height: startR * 2,
-      },
-      startAng + 90,
-      180,
-      false,
-    );
-
-    // Left rail forward — Catmull-Rom → Bezier cubics.
-    for (let i = 0; i < n - 1; i++) {
-      const i0 = Math.max(0, i - 1);
-      const i3 = Math.min(n - 1, i + 2);
-      path.cubicTo(
-        lx[i] + (lx[i + 1] - lx[i0]) / 6,
-        ly[i] + (ly[i + 1] - ly[i0]) / 6,
-        lx[i + 1] - (lx[i3] - lx[i]) / 6,
-        ly[i + 1] - (ly[i3] - ly[i]) / 6,
-        lx[i + 1],
-        ly[i + 1],
-      );
-    }
-
-    // End cap: semicircle left[n-1] → right[n-1].
-    const endR = radii[n - 1];
-    const endAng = Math.atan2(perpY[n - 1], perpX[n - 1]) * (180 / Math.PI);
-    path.arcToOval(
-      {
-        x: pts[n - 1].x - endR,
-        y: pts[n - 1].y - endR,
-        width: endR * 2,
-        height: endR * 2,
-      },
-      endAng - 90,
-      180,
-      false,
-    );
-
-    // Right rail backward — Catmull-Rom → Bezier cubics (reversed).
-    for (let i = n - 1; i > 0; i--) {
-      const i0 = Math.min(n - 1, i + 1);
-      const i3 = Math.max(0, i - 2);
-      path.cubicTo(
-        rx[i] + (rx[i - 1] - rx[i0]) / 6,
-        ry[i] + (ry[i - 1] - ry[i0]) / 6,
-        rx[i - 1] - (rx[i3] - rx[i]) / 6,
-        ry[i - 1] - (ry[i3] - ry[i]) / 6,
-        rx[i - 1],
-        ry[i - 1],
-      );
-    }
-
-    path.close();
+    const outline = buildOutlineArrays(strokePoints, this.opts);
+    const path = assembleSkiaPath(strokePoints, outline, this.opts);
     path.setIsVolatile(true);
     return path;
   }
 
   get pointCount(): number {
-    return this.points.length;
+    return this.rawPoints.length;
   }
 
   getPoints(): Point[] {
-    return this.points;
+    return this.rawPoints;
   }
 
   reset(): void {
-    this.points = [];
-    this._radii.length = 0;
-    this._perpX.length = 0;
-    this._perpY.length = 0;
-    this._leftX.length = 0;
-    this._leftY.length = 0;
-    this._rightX.length = 0;
-    this._rightY.length = 0;
-    this._cacheValid = -1;
+    this.rawPoints = [];
+    this.smoothedPoints = [];
   }
 
   updateSettings(minRadius: number, maxRadius: number): void {
     this.minRadius = minRadius;
     this.maxRadius = maxRadius;
+    const size = maxRadius * 2;
+    const thinning = maxRadius > 0 ? 1 - (minRadius / maxRadius) : 0.5;
+    this.opts.size = size;
+    this.opts.thinning = thinning;
   }
 }
