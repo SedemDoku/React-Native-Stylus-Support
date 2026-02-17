@@ -1,37 +1,22 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+import React from 'react';
+import { StatusBar, StyleSheet, Text, useColorScheme, View } from 'react-native';
+import { useStylusEvents } from 'react-native-stylus-events';
 
-import { NewAppScreen } from '@react-native/new-app-screen';
-import { StatusBar, StyleSheet, useColorScheme, View } from 'react-native';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
-} from 'react-native-safe-area-context';
-
-function App() {
+export default function App() {
   const isDarkMode = useColorScheme() === 'dark';
+  const [info, setInfo] = React.useState('Touch with stylus...');
 
-  return (
-    <SafeAreaProvider>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <AppContent />
-    </SafeAreaProvider>
-  );
-}
-
-function AppContent() {
-  const safeAreaInsets = useSafeAreaInsets();
+  useStylusEvents({
+    onStylusDown: (e) => setInfo(`Pressure: ${e.pressure.toFixed(2)}`),
+    onStylusMove: (e) => setInfo(`X: ${e.x.toFixed(0)}, Y: ${e.y.toFixed(0)}`),
+    onStylusUp: () => setInfo('Stylus up'),
+  });
 
   return (
     <View style={styles.container}>
-      <NewAppScreen
-        templateFileName="App.tsx"
-        safeAreaInsets={safeAreaInsets}
-      />
+      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+      <Text style={styles.title}>Stylus Events Test</Text>
+      <Text style={styles.info}>{info}</Text>
     </View>
   );
 }
@@ -39,7 +24,16 @@ function AppContent() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: '600',
+    marginBottom: 12,
+  },
+  info: {
+    fontSize: 18,
   },
 });
-
-export default App;

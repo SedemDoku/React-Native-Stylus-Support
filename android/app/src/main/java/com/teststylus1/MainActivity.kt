@@ -4,6 +4,7 @@ import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
 import com.facebook.react.defaults.DefaultReactActivityDelegate
+import com.stylusevents.StylusEventDispatcher
 
 class MainActivity : ReactActivity() {
 
@@ -19,4 +20,14 @@ class MainActivity : ReactActivity() {
    */
   override fun createReactActivityDelegate(): ReactActivityDelegate =
       DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
+
+  override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+    StylusEventDispatcher.dispatch(ev)
+    return super.dispatchTouchEvent(ev)
+  }
+
+  override fun dispatchGenericMotionEvent(ev: android.view.MotionEvent): Boolean {
+    StylusEventDispatcher.dispatch(ev)
+    return super.dispatchGenericMotionEvent(ev)
+  }
 }
