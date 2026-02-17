@@ -6,9 +6,19 @@ export default function App() {
   const isDarkMode = useColorScheme() === 'dark';
   const [info, setInfo] = React.useState('Touch with stylus...');
 
+  const formatEvent = (
+    label: string,
+    e: { x: number; y: number; pressure: number; tiltX: number; tiltY: number; orientation: number }
+  ) =>
+    `${label}\n` +
+    `X: ${e.x.toFixed(0)}  Y: ${e.y.toFixed(0)}\n` +
+    `Pressure: ${e.pressure.toFixed(2)}\n` +
+    `TiltX: ${e.tiltX.toFixed(2)}  TiltY: ${e.tiltY.toFixed(2)}\n` +
+    `Orientation: ${e.orientation.toFixed(2)}`;
+
   useStylusEvents({
-    onStylusDown: (e) => setInfo(`Pressure: ${e.pressure.toFixed(2)}`),
-    onStylusMove: (e) => setInfo(`X: ${e.x.toFixed(0)}, Y: ${e.y.toFixed(0)}`),
+    onStylusDown: (e) => setInfo(formatEvent('Stylus down', e)),
+    onStylusMove: (e) => setInfo(formatEvent('Stylus move', e)),
     onStylusUp: () => setInfo('Stylus up'),
   });
 
